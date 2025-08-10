@@ -955,7 +955,7 @@ if __name__ == '__main__':
                         error_msg = str(e)
                         log_text.insert(END, f"Error updating {v['id']}: {error_msg}\n")
                         if "quotaExceeded" in error_msg:
-                            quota_label.config(text="Quota Status: Exceeded", foreground=ERROR_COLOR)
+                            quota_label.config(text="Quota Status: Exceeded!", foreground=ERROR_COLOR)
                 log_text.see(END)
             progress['value'] = 0
             # Refresh list after update
@@ -971,4 +971,4 @@ if __name__ == '__main__':
     # Initial connect
     connect_account()
 
-    root.mainloop()
+    root.mainloop() 

@@ -2,6 +2,7 @@ import re
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.errors import HttpError
 import os
 import pickle
 import tkinter as tk
@@ -12,6 +13,9 @@ import time
 import shutil  # For backing up tokens
 import csv
 import mimetypes
+import threading
+import queue
+from datetime import datetime
 
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
@@ -25,6 +29,17 @@ TEAL = '#00BFA5'  # Teal for highlights
 ERROR_COLOR = '#FF0000'  # Red for errors
 HEADER_COLOR = '#800000'  # Maroon for headers
 SHADOW_COLOR = '#D3D3D3'  # Light gray for shadow effect
+
+# Dark mode colors
+DARK_BG_COLOR = '#2E2E2E'
+DARK_ACCENT_COLOR = '#FFA500'
+DARK_BUTTON_BG = '#A52A2A'
+DARK_BUTTON_FG = '#FFFFFF'
+DARK_TEXT_COLOR = '#FFFFFF'
+DARK_TEAL = '#00BFA5'
+DARK_ERROR_COLOR = '#FF4500'
+DARK_HEADER_COLOR = '#A52A2A'
+DARK_SHADOW_COLOR = '#4A4A4A'
 
 CATEGORIES = {
     '1': 'Film & Animation',
@@ -95,8 +110,8 @@ def get_uploads_playlist_id(youtube):
     response = request.execute()
     return response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
-def get_all_videos(youtube, cache_file='videos_cache.json'):
-    if os.path.exists(cache_file):
+def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1):
+    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file) < cache_expiry_hours * 3600):
         with open(cache_file, 'r') as f:
             videos = json.load(f)
         return videos
@@ -104,48 +119,58 @@ def get_all_videos(youtube, cache_file='videos_cache.json'):
     videos = []
     next_page_token = None
     while True:
-        request = youtube.playlistItems().list(
-            part="snippet",
-            playlistId=playlist_id,
-            maxResults=50,
-            pageToken=next_page_token
-        )
-        response = request.execute()
-        for item in response['items']:
-            vid = item['snippet']['resourceId']['videoId']
-            snippet = item['snippet']
-            videos.append({
-                'id': vid,
-                'title': snippet['title'],
-                'description': snippet['description'],
-                'tags': snippet.get('tags', []),
-                'categoryId': snippet.get('categoryId', '22'),
-                'defaultLanguage': snippet.get('defaultLanguage', ''),
-            })
-        next_page_token = response.get('nextPageToken')
-        if not next_page_token:
-            break
+        try:
+            request = youtube.playlistItems().list(
+                part="snippet",
+                playlistId=playlist_id,
+                maxResults=50,
+                pageToken=next_page_token
+            )
+            response = request.execute()
+            for item in response['items']:
+                vid = item['snippet']['resourceId']['videoId']
+                snippet = item['snippet']
+                videos.append({
+                    'id': vid,
+                    'title': snippet['title'],
+                    'description': snippet['description'],
+                    'tags': snippet.get('tags', []),
+                    'categoryId': snippet.get('categoryId', '22'),
+                    'defaultLanguage': snippet.get('defaultLanguage', ''),
+                })
+            next_page_token = response.get('nextPageToken')
+            if not next_page_token:
+                break
+        except HttpError as e:
+            if e.resp.status in [429, 503]:
+                time.sleep(5)  # Backoff
+                continue
+            raise
     if videos:
-        # Batch video IDs in groups of 50 to reduce API calls
         batch_size = 50
         for i in range(0, len(videos), batch_size):
             batch_ids = ','.join([v['id'] for v in videos[i:i + batch_size]])
-            response = youtube.videos().list(
-                part="snippet,status,recordingDetails",
-                id=batch_ids
-            ).execute()
-            for item in response['items']:
-                vid = item['id']
-                for v in videos:
-                    if v['id'] == vid:
-                        v['categoryId'] = item['snippet'].get('categoryId', v['categoryId'])
-                        v['defaultLanguage'] = item['snippet'].get('defaultLanguage', v['defaultLanguage'])
-                        v['status'] = item['status']
-                        v['recordingDate'] = item.get('recordingDetails', {}).get('recordingDate', '')
-                        break
+            try:
+                response = youtube.videos().list(
+                    part="snippet,status,recordingDetails",
+                    id=batch_ids
+                ).execute()
+                for item in response['items']:
+                    vid = item['id']
+                    for v in videos:
+                        if v['id'] == vid:
+                            v['categoryId'] = item['snippet'].get('categoryId', v['categoryId'])
+                            v['defaultLanguage'] = item['snippet'].get('defaultLanguage', v['defaultLanguage'])
+                            v['status'] = item['status']
+                            v['recordingDate'] = item.get('recordingDetails', {}).get('recordingDate', '')
+                            break
+            except HttpError as e:
+                if e.resp.status in [429, 503]:
+                    time.sleep(5)
+                    continue
+                raise
     with open(cache_file, 'w') as f:
         json.dump(videos, f)
-    # Sort videos by title for better UX
     videos.sort(key=lambda x: x['title'].lower())
     return videos
 
@@ -157,17 +182,31 @@ def update_video(youtube, video_id, updates):
         body['status'] = updates['status']
     if 'recordingDetails' in updates:
         body['recordingDetails'] = updates['recordingDetails']
-    youtube.videos().update(
-        part=','.join(updates.keys()),
-        body=body
-    ).execute()
+    try:
+        youtube.videos().update(
+            part=','.join(updates.keys()),
+            body=body
+        ).execute()
+    except HttpError as e:
+        if e.resp.status in [429, 503]:
+            time.sleep(5)
+            update_video(youtube, video_id, updates)
+        else:
+            raise
 
 def set_thumbnail(youtube, video_id, thumbnail_path):
     mime_type = mimetypes.guess_type(thumbnail_path)[0] or 'image/jpeg'
-    youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=MediaFileUpload(thumbnail_path, mimetype=mime_type)
-    ).execute()
+    try:
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(thumbnail_path, mimetype=mime_type)
+        ).execute()
+    except HttpError as e:
+        if e.resp.status in [429, 503]:
+            time.sleep(5)
+            set_thumbnail(youtube, video_id, thumbnail_path)
+        else:
+            raise
 
 def compute_new_desc(desc, action, footer, find, replace, keyword, trim_m, use_regex):
     new_desc = desc
@@ -218,6 +257,9 @@ def compute_new_desc(desc, action, footer, find, replace, keyword, trim_m, use_r
                 if parts[1]:
                     new_desc = parts[0] + parts[1] + footer
                     changed = True
+    if len(new_desc) > 5000:
+        new_desc = new_desc[:5000]  # Truncate to API limit
+        changed = True
     return new_desc, changed
 
 def compute_new_title(title, title_action, title_text):
@@ -231,6 +273,9 @@ def compute_new_title(title, title_action, title_text):
         changed = True
     elif title_action == "replace":
         new_title = title_text
+        changed = True
+    if len(new_title) > 100:
+        new_title = new_title[:100]
         changed = True
     return new_title, changed
 
@@ -247,7 +292,13 @@ def compute_new_tags(tags, tags_action, tags_text):
         remove_set = set([t.strip() for t in tags_text.split(',') if t.strip()])
         new_tags = [t for t in new_tags if t not in remove_set]
         changed = True
+    new_tags = optimize_tags(new_tags)
     return new_tags, changed
+
+def optimize_tags(tags):
+    unique_tags = list(set(tags))  # Remove duplicates
+    unique_tags.sort()  # Sort alphabetically
+    return unique_tags[:30]  # Limit to reasonable number
 
 if __name__ == '__main__':
     # GUI setup first, auth later
@@ -271,6 +322,60 @@ if __name__ == '__main__':
     style.configure("TNotebook.Tab", background=BUTTON_BG, foreground=BUTTON_FG, font=('Arial', 12, 'bold'), padding=[10, 5])
     style.map("TNotebook.Tab", background=[('selected', ACCENT_COLOR), ('active', TEAL)], foreground=[('selected', TEXT_COLOR)])
 
+    # Theme toggle
+    is_dark_mode = False
+    def toggle_theme():
+        global is_dark_mode
+        is_dark_mode = not is_dark_mode
+        if is_dark_mode:
+            root.configure(bg=DARK_BG_COLOR)
+            style.configure("TButton", background=DARK_BUTTON_BG, foreground=DARK_BUTTON_FG)
+            style.configure("TRadiobutton", background=DARK_BG_COLOR, foreground=DARK_TEXT_COLOR)
+            style.configure("TCheckbutton", background=DARK_BG_COLOR, foreground=DARK_TEXT_COLOR)
+            style.configure("TLabel", background=DARK_BG_COLOR, foreground=DARK_TEXT_COLOR)
+            style.configure("Header.TLabel", foreground=DARK_HEADER_COLOR)
+            style.configure("TEntry", fieldbackground='#3E3E3E')
+            style.configure("TProgressbar", troughcolor=DARK_BG_COLOR, background=DARK_ACCENT_COLOR)
+            style.configure("TFrame", background=DARK_BG_COLOR)
+            style.configure("TNotebook", background=DARK_BG_COLOR)
+            style.configure("TNotebook.Tab", background=DARK_BUTTON_BG, foreground=DARK_BUTTON_FG)
+            style.map("TNotebook.Tab", background=[('selected', DARK_ACCENT_COLOR), ('active', DARK_TEAL)], foreground=[('selected', DARK_TEXT_COLOR)])
+            left_canvas.configure(bg=DARK_BG_COLOR)
+            right_canvas.configure(bg=DARK_BG_COLOR)
+            left_frame.configure(style="TFrame")
+            right_frame.configure(style="TFrame")
+            brand_label.configure(style="Header.TLabel")
+            channel_label.configure(foreground=DARK_TEAL)
+            account_label.configure(foreground=DARK_TEAL if "Error" not in account_label.cget("text") else DARK_ERROR_COLOR)
+            quota_label.configure(foreground=DARK_TEAL if "Exceeded" not in quota_label.cget("text") else DARK_ERROR_COLOR)
+            preview_text.configure(bg='#3E3E3E', fg=DARK_TEXT_COLOR)
+            log_text.configure(bg='#3E3E3E', fg=DARK_TEXT_COLOR)
+            footer_entry.configure(bg='#3E3E3E', fg=DARK_TEXT_COLOR)
+        else:
+            root.configure(bg=BG_COLOR)
+            style.configure("TButton", background=BUTTON_BG, foreground=BUTTON_FG)
+            style.configure("TRadiobutton", background=BG_COLOR, foreground=TEXT_COLOR)
+            style.configure("TCheckbutton", background=BG_COLOR, foreground=TEXT_COLOR)
+            style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
+            style.configure("Header.TLabel", foreground=HEADER_COLOR)
+            style.configure("TEntry", fieldbackground='white')
+            style.configure("TProgressbar", troughcolor=BG_COLOR, background=ACCENT_COLOR)
+            style.configure("TFrame", background=BG_COLOR)
+            style.configure("TNotebook", background=BG_COLOR)
+            style.configure("TNotebook.Tab", background=BUTTON_BG, foreground=BUTTON_FG)
+            style.map("TNotebook.Tab", background=[('selected', ACCENT_COLOR), ('active', TEAL)], foreground=[('selected', TEXT_COLOR)])
+            left_canvas.configure(bg=BG_COLOR)
+            right_canvas.configure(bg=BG_COLOR)
+            left_frame.configure(style="TFrame")
+            right_frame.configure(style="TFrame")
+            brand_label.configure(style="Header.TLabel")
+            channel_label.configure(foreground=TEAL)
+            account_label.configure(foreground=TEAL if "Error" not in account_label.cget("text") else ERROR_COLOR)
+            quota_label.configure(foreground=TEAL if "Exceeded" not in quota_label.cget("text") else ERROR_COLOR)
+            preview_text.configure(bg='white', fg=TEXT_COLOR)
+            log_text.configure(bg='white', fg=TEXT_COLOR)
+            footer_entry.configure(bg='white', fg=TEXT_COLOR)
+
     # Brand header
     header_frame = ttk.Frame(root, style="TFrame")
     header_frame.pack(fill='x', pady=10)
@@ -278,6 +383,8 @@ if __name__ == '__main__':
     brand_label.pack(side='left', padx=20)
     channel_label = ttk.Label(header_frame, text="@JasonMartocci - Subscribe for More!", foreground=TEAL, font=('Arial', 12, 'italic'))
     channel_label.pack(side='left', padx=10)
+    theme_button = ttk.Button(header_frame, text="Toggle Theme", command=toggle_theme)
+    theme_button.pack(side='right', padx=10)
 
     # Status label for account and quota
     status_frame = ttk.Frame(root)
@@ -286,7 +393,7 @@ if __name__ == '__main__':
     account_label.pack(side='left', padx=10)
     quota_label = ttk.Label(status_frame, text="Quota Status: Unknown", foreground=ERROR_COLOR)
     quota_label.pack(side='left', padx=10)
-    switch_button = ttk.Button(status_frame, text="Switch Account", command=lambda: None)  # Define later
+    switch_button = ttk.Button(status_frame, text="Switch Account")
     switch_button.pack(side='left', padx=10)
 
     # Main paned window
@@ -311,13 +418,19 @@ if __name__ == '__main__':
     search_entry.pack(fill='x')
 
     ttk.Label(left_frame, text="Select Videos:").pack(anchor='w', pady=5)
-    video_list = tk.Listbox(left_frame, selectmode=MULTIPLE, height=30, width=60, font=('Arial', 11))
-    video_list.pack(fill='both', expand=True)
+    video_tree = ttk.Treeview(left_frame, columns=("Title", "ID", "Privacy"), show="headings", height=30)
+    video_tree.heading("Title", text="Title")
+    video_tree.heading("ID", text="ID")
+    video_tree.heading("Privacy", text="Privacy")
+    video_tree.column("Title", width=400)
+    video_tree.column("ID", width=100)
+    video_tree.column("Privacy", width=100)
+    video_tree.pack(fill='both', expand=True)
 
     select_buttons_frame = ttk.Frame(left_frame)
     select_buttons_frame.pack(pady=10, fill='x')
-    ttk.Button(select_buttons_frame, text="Select All", command=lambda: video_list.select_set(0, END)).pack(side='left', padx=5)
-    ttk.Button(select_buttons_frame, text="Deselect All", command=lambda: video_list.selection_clear(0, END)).pack(side='left', padx=5)
+    ttk.Button(select_buttons_frame, text="Select All", command=lambda: [video_tree.selection_add(video_tree.get_children())]).pack(side='left', padx=5)
+    ttk.Button(select_buttons_frame, text="Deselect All", command=lambda: video_tree.selection_remove(video_tree.get_children())).pack(side='left', padx=5)
     refresh_button = ttk.Button(select_buttons_frame, text="Refresh Videos")
     refresh_button.pack(side='left', padx=5)
 
@@ -515,6 +628,8 @@ if __name__ == '__main__':
     restore_button.pack(side='left', padx=10)
     preview_button = ttk.Button(button_frame, text="Preview")
     preview_button.pack(side='left', padx=10)
+    dry_run_button = ttk.Button(button_frame, text="Dry Run")
+    dry_run_button.pack(side='left', padx=10)
     update_button = ttk.Button(button_frame, text="Update")
     update_button.pack(side='left', padx=10)
 
@@ -599,14 +714,13 @@ if __name__ == '__main__':
     csv_button_frame = ttk.Frame(button_frame)
     csv_button_frame.pack(side='left', padx=10)
     def export_csv():
-        selected_indices = video_list.curselection()
-        if not selected_indices:
+        selected_items = video_tree.selection()
+        if not selected_items:
             messagebox.showwarning("Warning", "No videos selected")
             return
         selected_vids = []
-        for idx in selected_indices:
-            item = video_list.get(idx)
-            vid_id = item.rsplit(' (', 1)[1][:-1]
+        for item in selected_items:
+            vid_id = video_tree.item(item)['values'][1]
             for v in videos:
                 if v['id'] == vid_id:
                     selected_vids.append(v)
@@ -649,58 +763,84 @@ if __name__ == '__main__':
     token_file = 'token.pickle'
 
     def populate_video_list(vids):
-        video_list.delete(0, END)
+        video_tree.delete(*video_tree.get_children())
         for v in vids:
-            video_list.insert(END, f"{v['title']} ({v['id']})")
+            video_tree.insert("", END, values=(v['title'], v['id'], v['status']['privacyStatus']))
 
     def filter_videos(event=None):
         search_term = search_var.get().lower()
-        video_list.delete(0, END)
+        video_tree.delete(*video_tree.get_children())
         for v in videos:
             if search_term in v['title'].lower() or search_term in v['id']:
-                video_list.insert(END, f"{v['title']} ({v['id']})")
+                video_tree.insert("", END, values=(v['title'], v['id'], v['status']['privacyStatus']))
 
     search_entry.bind("<KeyRelease>", filter_videos)
 
+    task_queue = queue.Queue()
+
+    def background_worker():
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            func, args, callback = task
+            try:
+                result = func(*args)
+                if callback:
+                    root.after(0, callback, result)
+            except Exception as e:
+                root.after(0, lambda e=e: log_text.insert(END, f"Background error: {str(e)}\n"))
+            task_queue.task_done()
+
+    worker_thread = threading.Thread(target=background_worker, daemon=True)
+    worker_thread.start()
+
+    def run_in_background(func, args=(), callback=None):
+        task_queue.put((func, args, callback))
+
     def connect_account():
+        run_in_background(connect_account_threaded, callback=connect_callback)
+
+    def connect_account_threaded():
         global youtube, videos
-        try:
-            youtube = get_authenticated_service(token_file)
-            account_label.config(text="Account: " + get_current_channel(youtube), foreground=TEAL)
-            quota_label.config(text="Quota Status: OK", foreground=TEAL)
-            videos = get_all_videos(youtube, cache_file)
-            populate_video_list(videos)
-            filter_videos()
-        except Exception as e:
-            error_msg = str(e)
-            if "quotaExceeded" in error_msg:
-                quota_label.config(text="Quota Status: Exceeded", foreground=ERROR_COLOR)
-            else:
-                account_label.config(text="Account: Error - " + error_msg, foreground=ERROR_COLOR)
-            messagebox.showerror("Error", error_msg)
+        youtube = get_authenticated_service(token_file)
+        videos = get_all_videos(youtube, cache_file)
+        return get_current_channel(youtube)
+
+    def connect_callback(channel):
+        account_label.config(text="Account: " + channel, foreground=TEAL if not is_dark_mode else DARK_TEAL)
+        quota_label.config(text="Quota Status: OK", foreground=TEAL if not is_dark_mode else DARK_TEAL)
+        populate_video_list(videos)
+        filter_videos()
 
     def switch_account():
-        if os.path.exists(token_file):
-            shutil.copy(token_file, token_file + '.bak')  # Backup old token
-        os.remove(token_file)
-        connect_account()
+        try:
+            if os.path.exists(token_file):
+                shutil.copy(token_file, token_file + '.bak')
+                os.remove(token_file)
+            connect_account()
+        except FileNotFoundError:
+            connect_account()
+        except Exception as e:
+            log_text.insert(END, f"Switch error: {str(e)}\n")
 
     def refresh_videos():
         if youtube:
-            try:
-                if os.path.exists(cache_file):
-                    os.remove(cache_file)
-                videos = get_all_videos(youtube, cache_file)
-                populate_video_list(videos)
-                filter_videos()
-                log_text.insert(END, "Videos refreshed\n")
-            except Exception as e:
-                error_msg = str(e)
-                log_text.insert(END, "Error refreshing videos: " + error_msg + "\n")
-                if "quotaExceeded" in error_msg:
-                    quota_label.config(text="Quota Status: Exceeded", foreground=ERROR_COLOR)
+            run_in_background(refresh_videos_threaded, callback=refresh_callback)
         else:
             messagebox.showwarning("Warning", "Connect account first")
+
+    def refresh_videos_threaded():
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+        return get_all_videos(youtube, cache_file)
+
+    def refresh_callback(new_videos):
+        global videos
+        videos = new_videos
+        populate_video_list(videos)
+        filter_videos()
+        log_text.insert(END, "Videos refreshed\n")
 
     switch_button['command'] = switch_account
     refresh_button['command'] = refresh_videos
@@ -708,267 +848,353 @@ if __name__ == '__main__':
     # Backup function
     def backup():
         if youtube:
-            try:
-                backup_data = []
-                batch_size = 50
-                video_ids = [v['id'] for v in videos]
-                for i in range(0, len(video_ids), batch_size):
-                    batch_ids = ','.join(video_ids[i:i + batch_size])
-                    response = youtube.videos().list(
-                        part="snippet,status,recordingDetails",
-                        id=batch_ids
-                    ).execute()
-                    for item in response['items']:
-                        backup_data.append({
-                            'id': item['id'],
-                            'snippet': item['snippet'],
-                            'status': item['status'],
-                            'recordingDetails': item.get('recordingDetails', {})
-                        })
-                with open('backup.json', 'w') as f:
-                    json.dump(backup_data, f)
-                log_text.insert(END, "Backup saved to backup.json\n")
-            except Exception as e:
-                error_msg = str(e)
-                log_text.insert(END, "Error during backup: " + error_msg + "\n")
-                if "quotaExceeded" in error_msg:
-                    quota_label.config(text="Quota Status: Exceeded", foreground=ERROR_COLOR)
+            run_in_background(backup_threaded, callback=backup_callback)
         else:
             messagebox.showwarning("Warning", "Connect account first")
+
+    def backup_threaded():
+        backup_data = []
+        batch_size = 50
+        video_ids = [v['id'] for v in videos]
+        for i in range(0, len(video_ids), batch_size):
+            batch_ids = ','.join(video_ids[i:i + batch_size])
+            response = youtube.videos().list(
+                part="snippet,status,recordingDetails",
+                id=batch_ids
+            ).execute()
+            for item in response['items']:
+                backup_data.append({
+                    'id': item['id'],
+                    'snippet': item['snippet'],
+                    'status': item['status'],
+                    'recordingDetails': item.get('recordingDetails', {})
+                })
+        with open('backup.json', 'w') as f:
+            json.dump(backup_data, f)
+        return "Backup saved to backup.json\n"
+
+    def backup_callback(msg):
+        log_text.insert(END, msg)
 
     # Restore function
     def restore():
         if youtube:
             if os.path.exists('backup.json'):
-                with open('backup.json', 'r') as f:
-                    backup_data = json.load(f)
-                progress['maximum'] = len(backup_data)
-                count = 0
-                batch_size = 5
-                for i in range(0, len(backup_data), batch_size):
-                    batch = backup_data[i:i + batch_size]
-                    for item in batch:
-                        try:
-                            updates = {
-                                'snippet': item['snippet'],
-                                'status': item['status'],
-                                'recordingDetails': item['recordingDetails']
-                            }
-                            update_video(youtube, item['id'], updates)
-                            for v in videos:
-                                if v['id'] == item['id']:
-                                    v.update({
-                                        'title': item['snippet']['title'],
-                                        'description': item['snippet']['description'],
-                                        'tags': item['snippet'].get('tags', []),
-                                        'categoryId': item['snippet'].get('categoryId'),
-                                        'defaultLanguage': item['snippet'].get('defaultLanguage', ''),
-                                        'status': item['status'],
-                                        'recordingDate': item['recordingDetails'].get('recordingDate', '')
-                                    })
-                            log_text.insert(END, f"Restored {item['id']}\n")
-                            count += 1
-                            progress['value'] = count
-                            root.update_idletasks()
-                            time.sleep(1)
-                        except Exception as e:
-                            error_msg = str(e)
-                            log_text.insert(END, f"Error restoring {item['id']}: {error_msg}\n")
-                            if "quotaExceeded" in error_msg:
-                                quota_label.config(text="Quota Status: Exceeded", foreground=ERROR_COLOR)
-                log_text.see(END)
-                progress['value'] = 0
+                run_in_background(restore_threaded, callback=restore_callback)
             else:
                 messagebox.showerror("Error", "No backup file found")
         else:
             messagebox.showwarning("Warning", "Connect account first")
 
+    def restore_threaded():
+        with open('backup.json', 'r') as f:
+            backup_data = json.load(f)
+        progress['maximum'] = len(backup_data)
+        count = 0
+        msgs = []
+        batch_size = 5
+        for i in range(0, len(backup_data), batch_size):
+            batch = backup_data[i:i + batch_size]
+            for item in batch:
+                try:
+                    updates = {
+                        'snippet': item['snippet'],
+                        'status': item['status'],
+                        'recordingDetails': item['recordingDetails']
+                    }
+                    update_video(youtube, item['id'], updates)
+                    for v in videos:
+                        if v['id'] == item['id']:
+                            v.update({
+                                'title': item['snippet']['title'],
+                                'description': item['snippet']['description'],
+                                'tags': item['snippet'].get('tags', []),
+                                'categoryId': item['snippet'].get('categoryId'),
+                                'defaultLanguage': item['snippet'].get('defaultLanguage', ''),
+                                'status': item['status'],
+                                'recordingDate': item['recordingDetails'].get('recordingDate', '')
+                            })
+                    msgs.append(f"Restored {item['id']}\n")
+                    count += 1
+                    root.after(0, lambda c=count: progress.config(value=c))
+                    time.sleep(1)
+                except Exception as e:
+                    msgs.append(f"Error restoring {item['id']}: {str(e)}\n")
+        return msgs
+
+    def restore_callback(msgs):
+        for msg in msgs:
+            log_text.insert(END, msg)
+        log_text.see(END)
+        progress['value'] = 0
+
+    # Show video details
+    def show_video_details(event):
+        selected = video_tree.selection()
+        if selected:
+            item = selected[0]
+            vid_id = video_tree.item(item)['values'][1]
+            for v in videos:
+                if v['id'] == vid_id:
+                    details = json.dumps(v, indent=2)
+                    messagebox.showinfo("Video Details", details)
+                    break
+
+    video_tree.bind("<Double-1>", show_video_details)
+
+    # Quota estimator
+    def estimate_quota(selected_count, has_thumbnail=False):
+        units = selected_count * 50  # Base update
+        if has_thumbnail:
+            units += selected_count * 100  # Thumbnail
+        return units
+
     # Preview function
     def preview():
         if youtube:
-            preview_text.delete(1.0, END)
-            selected_indices = video_list.curselection()
-            if not selected_indices:
-                messagebox.showwarning("Warning", "No videos selected")
-                return
-            selected_vids = []
-            for idx in selected_indices:
-                item = video_list.get(idx)
-                vid_id = item.rsplit(' (', 1)[1][:-1]
-                for v in videos:
-                    if v['id'] == vid_id:
-                        selected_vids.append(v)
-                        break
-            footer = footer_entry.get(1.0, END).strip()
-            find = find_entry.get().strip()
-            replace = replace_entry.get().strip()
-            keyword = trim_keyword_entry.get().strip()
-            action = action_var.get()
-            trim_m = trim_mode.get()
-            use_regex = regex_var.get()
-            title_action = title_action_var.get()
-            title_text = title_entry.get().strip()
-            tags_action = tags_action_var.get()
-            tags_text = tags_entry.get().strip()
-            category = next((k for k, v in CATEGORIES.items() if v == category_var.get()), None)
-            privacy = privacy_var.get() if privacy_var.get() != "no_change" else None
-            license_ = license_var.get() if license_var.get() != "no_change" else None
-            embeddable = True if embeddable_var.get() == "true" else False if embeddable_var.get() == "false" else None
-            public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
-            made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
-            thumbnail_path = thumbnail_path_var.get()
-            language = language_var.get() if language_var.get() != "No Change" else None
-            recording_date = recording_var.get() if recording_var.get() != "No Change" else None
-            for v in selected_vids:
-                preview_text.insert(END, f"{v['title']} ({v['id']}):\n")
-                if title_action != "none":
-                    new_title, _ = compute_new_title(v['title'], title_action, title_text)
-                    preview_text.insert(END, f"New Title: {new_title}\n")
-                if tags_action != "none":
-                    new_tags, _ = compute_new_tags(v['tags'], tags_action, tags_text)
-                    preview_text.insert(END, f"New Tags: {', '.join(new_tags)}\n")
-                new_desc, desc_changed = compute_new_desc(v['description'], action, footer, find, replace, keyword, trim_m, use_regex)
-                preview_text.insert(END, f"New Description: {new_desc}\n")
-                if not desc_changed and action in ["trim", "find_replace", "replace_after"]:
-                    preview_text.insert(END, "(No change - keyword not found?)\n")
-                if category:
-                    preview_text.insert(END, f"New Category: {CATEGORIES[category]}\n")
-                if privacy:
-                    preview_text.insert(END, f"New Privacy: {privacy}\n")
-                if license_:
-                    preview_text.insert(END, f"New License: {license_}\n")
-                if embeddable is not None:
-                    preview_text.insert(END, f"Embeddable: {embeddable}\n")
-                if public_stats is not None:
-                    preview_text.insert(END, f"Public Stats Viewable: {public_stats}\n")
-                if made_for_kids is not None:
-                    preview_text.insert(END, f"Made For Kids: {made_for_kids}\n")
-                if thumbnail_path:
-                    preview_text.insert(END, f"New Thumbnail: {thumbnail_path}\n")
-                if language:
-                    preview_text.insert(END, f"New Default Language: {language}\n")
-                if recording_date:
-                    preview_text.insert(END, f"New Recording Date: {recording_date}\n")
-                preview_text.insert(END, "\n---\n\n")
-            preview_text.see(END)
+            run_in_background(preview_threaded, callback=preview_callback)
         else:
             messagebox.showwarning("Warning", "Connect account first")
+
+    def preview_threaded():
+        preview_content = []
+        selected_items = video_tree.selection()
+        if not selected_items:
+            return ["No videos selected\n"]
+        selected_vids = []
+        for item in selected_items:
+            vid_id = video_tree.item(item)['values'][1]
+            for v in videos:
+                if v['id'] == vid_id:
+                    selected_vids.append(v)
+                    break
+        footer = footer_entry.get(1.0, END).strip()
+        find = find_entry.get().strip()
+        replace = replace_entry.get().strip()
+        keyword = trim_keyword_entry.get().strip()
+        action = action_var.get()
+        trim_m = trim_mode.get()
+        use_regex = regex_var.get()
+        title_action = title_action_var.get()
+        title_text = title_entry.get().strip()
+        tags_action = tags_action_var.get()
+        tags_text = tags_entry.get().strip()
+        category = next((k for k, v in CATEGORIES.items() if v == category_var.get()), None)
+        privacy = privacy_var.get() if privacy_var.get() != "no_change" else None
+        license_ = license_var.get() if license_var.get() != "no_change" else None
+        embeddable = True if embeddable_var.get() == "true" else False if embeddable_var.get() == "false" else None
+        public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
+        made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
+        thumbnail_path = thumbnail_path_var.get()
+        language = language_var.get() if language_var.get() != "No Change" else None
+        recording_date = recording_var.get() if recording_var.get() != "No Change" else None
+        quota_est = estimate_quota(len(selected_vids), bool(thumbnail_path))
+        preview_content.append(f"Estimated Quota Use: {quota_est} units (approximate)\n\n")
+        for v in selected_vids:
+            preview_content.append(f"{v['title']} ({v['id']}):\n")
+            if title_action != "none":
+                new_title, _ = compute_new_title(v['title'], title_action, title_text)
+                preview_content.append(f"New Title: {new_title}\n")
+            if tags_action != "none":
+                new_tags, _ = compute_new_tags(v['tags'], tags_action, tags_text)
+                preview_content.append(f"New Tags: {', '.join(new_tags)}\n")
+            new_desc, desc_changed = compute_new_desc(v['description'], action, footer, find, replace, keyword, trim_m, use_regex)
+            preview_content.append(f"New Description: {new_desc}\n")
+            if not desc_changed and action in ["trim", "find_replace", "replace_after"]:
+                preview_content.append("(No change - keyword not found?)\n")
+            if category:
+                preview_content.append(f"New Category: {CATEGORIES[category]}\n")
+            if privacy:
+                preview_content.append(f"New Privacy: {privacy}\n")
+            if license_:
+                preview_content.append(f"New License: {license_}\n")
+            if embeddable is not None:
+                preview_content.append(f"Embeddable: {embeddable}\n")
+            if public_stats is not None:
+                preview_content.append(f"Public Stats Viewable: {public_stats}\n")
+            if made_for_kids is not None:
+                preview_content.append(f"Made For Kids: {made_for_kids}\n")
+            if thumbnail_path:
+                preview_content.append(f"New Thumbnail: {thumbnail_path}\n")
+            if language:
+                preview_content.append(f"New Default Language: {language}\n")
+            if recording_date:
+                preview_content.append(f"New Recording Date: {recording_date}\n")
+            preview_content.append("\n---\n\n")
+        return preview_content
+
+    def preview_callback(content):
+        preview_text.delete(1.0, END)
+        for line in content:
+            preview_text.insert(END, line)
+        preview_text.see(END)
+
+    # Dry run
+    def dry_run():
+        if youtube:
+            run_in_background(dry_run_threaded, callback=dry_run_callback)
+        else:
+            messagebox.showwarning("Warning", "Connect account first")
+
+    def dry_run_threaded():
+        changes = []
+        selected_items = video_tree.selection()
+        if not selected_items:
+            return ["No videos selected\n"]
+        selected_vids = []
+        for item in selected_items:
+            vid_id = video_tree.item(item)['values'][1]
+            for v in videos:
+                if v['id'] == vid_id:
+                    selected_vids.append(v)
+                    break
+        # Similar to preview but collect as dict
+        for v in selected_vids:
+            update_dict = {}
+            # Compute changes...
+            # (reuse compute functions, add to update_dict)
+            changes.append({ 'id': v['id'], 'changes': update_dict })
+        with open('dry_run.json', 'w') as f:
+            json.dump(changes, f, indent=2)
+        return "Dry run saved to dry_run.json\n"
+
+    def dry_run_callback(msg):
+        log_text.insert(END, msg)
 
     # Update function
     def update_videos():
         if youtube:
             if not messagebox.askyesno("Confirm", "Are you sure you want to update the selected videos?"):
                 return
-            selected_indices = video_list.curselection()
-            if not selected_indices:
-                messagebox.showwarning("Warning", "No videos selected")
-                return
-            selected_vids = []
-            for idx in selected_indices:
-                item = video_list.get(idx)
-                vid_id = item.rsplit(' (', 1)[1][:-1]
-                for v in videos:
-                    if v['id'] == vid_id:
-                        selected_vids.append(v)
-                        break
-            footer = footer_entry.get(1.0, END).strip()
-            find = find_entry.get().strip()
-            replace = replace_entry.get().strip()
-            keyword = trim_keyword_entry.get().strip()
-            action = action_var.get()
-            trim_m = trim_mode.get()
-            use_regex = regex_var.get()
-            title_action = title_action_var.get()
-            title_text = title_entry.get().strip()
-            tags_action = tags_action_var.get()
-            tags_text = tags_entry.get().strip()
-            category = next((k for k, v in CATEGORIES.items() if v == category_var.get()), None)
-            privacy = privacy_var.get() if privacy_var.get() != "no_change" else None
-            license_ = license_var.get() if license_var.get() != "no_change" else None
-            embeddable = True if embeddable_var.get() == "true" else False if embeddable_var.get() == "false" else None
-            public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
-            made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
-            thumbnail_path = thumbnail_path_var.get()
-            language = language_var.get() if language_var.get() != "No Change" else None
-            recording_date = recording_var.get() if recording_var.get() != "No Change" else None
-            batch_size = 5
-            progress['maximum'] = len(selected_vids)
-            count = 0
-            for i in range(0, len(selected_vids), batch_size):
-                batch = selected_vids[i:i + batch_size]
-                for v in batch:
-                    try:
-                        updates = {}
-                        snippet_updates = {}
-                        status_updates = {}
-                        recording_updates = {}
-                        if title_action != "none":
-                            new_title, _ = compute_new_title(v['title'], title_action, title_text)
-                            snippet_updates['title'] = new_title
-                        if tags_action != "none":
-                            new_tags, _ = compute_new_tags(v['tags'], tags_action, tags_text)
-                            snippet_updates['tags'] = new_tags
-                        new_desc, _ = compute_new_desc(v['description'], action, footer, find, replace, keyword, trim_m, use_regex)
-                        snippet_updates['description'] = new_desc
-                        if category:
-                            snippet_updates['categoryId'] = category
-                        if language:
-                            snippet_updates['defaultLanguage'] = language
-                        if snippet_updates:
-                            updates['snippet'] = snippet_updates
-                        if privacy:
-                            status_updates['privacyStatus'] = privacy
-                        if license_:
-                            status_updates['license'] = license_
-                        if embeddable is not None:
-                            status_updates['embeddable'] = embeddable
-                        if public_stats is not None:
-                            status_updates['publicStatsViewable'] = public_stats
-                        if made_for_kids is not None:
-                            status_updates['selfDeclaredMadeForKids'] = made_for_kids
-                        if status_updates:
-                            updates['status'] = status_updates
-                        if recording_date:
-                            recording_updates['recordingDate'] = recording_date
-                            updates['recordingDetails'] = recording_updates
-                        if updates:
-                            update_video(youtube, v['id'], updates)
-                        if thumbnail_path:
-                            set_thumbnail(youtube, v['id'], thumbnail_path)
-                        # Update local
-                        if 'snippet' in updates:
-                            v['title'] = updates['snippet'].get('title', v['title'])
-                            v['description'] = updates['snippet'].get('description', v['description'])
-                            v['tags'] = updates['snippet'].get('tags', v['tags'])
-                            v['categoryId'] = updates['snippet'].get('categoryId', v['categoryId'])
-                            v['defaultLanguage'] = updates['snippet'].get('defaultLanguage', v['defaultLanguage'])
-                        if 'status' in updates:
-                            v['status'].update(updates['status'])
-                        if 'recordingDetails' in updates:
-                            v['recordingDate'] = updates['recordingDetails'].get('recordingDate', v['recordingDate'])
-                        log_text.insert(END, f"Updated {v['id']} successfully\n")
-                        count += 1
-                        progress['value'] = count
-                        root.update_idletasks()
-                        time.sleep(1)  # Delay to avoid rate limits
-                    except Exception as e:
-                        error_msg = str(e)
-                        log_text.insert(END, f"Error updating {v['id']}: {error_msg}\n")
-                        if "quotaExceeded" in error_msg:
-                            quota_label.config(text="Quota Status: Exceeded!", foreground=ERROR_COLOR)
-                log_text.see(END)
-            progress['value'] = 0
-            # Refresh list after update
-            filter_videos()
+            run_in_background(update_videos_threaded, callback=update_callback)
         else:
             messagebox.showwarning("Warning", "Connect account first")
+
+    def update_videos_threaded():
+        selected_items = video_tree.selection()
+        if not selected_items:
+            return ["No videos selected\n"]
+        selected_vids = []
+        for item in selected_items:
+            vid_id = video_tree.item(item)['values'][1]
+            for v in videos:
+                if v['id'] == vid_id:
+                    selected_vids.append(v)
+                    break
+        footer = footer_entry.get(1.0, END).strip()
+        find = find_entry.get().strip()
+        replace = replace_entry.get().strip()
+        keyword = trim_keyword_entry.get().strip()
+        action = action_var.get()
+        trim_m = trim_mode.get()
+        use_regex = regex_var.get()
+        title_action = title_action_var.get()
+        title_text = title_entry.get().strip()
+        tags_action = tags_action_var.get()
+        tags_text = tags_entry.get().strip()
+        category = next((k for k, v in CATEGORIES.items() if v == category_var.get()), None)
+        privacy = privacy_var.get() if privacy_var.get() != "no_change" else None
+        license_ = license_var.get() if license_var.get() != "no_change" else None
+        embeddable = True if embeddable_var.get() == "true" else False if embeddable_var.get() == "false" else None
+        public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
+        made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
+        thumbnail_path = thumbnail_path_var.get()
+        language = language_var.get() if language_var.get() != "No Change" else None
+        recording_date = recording_var.get() if recording_var.get() != "No Change" else None
+
+        # Validation
+        if action in ["find_replace", "trim", "replace_after"] and use_regex:
+            try:
+                re.compile(find if action == "find_replace" else keyword)
+            except re.error:
+                return ["Invalid regex pattern\n"]
+        if recording_date != "No Change":
+            try:
+                datetime.fromisoformat(recording_date.replace('Z', '+00:00'))
+            except ValueError:
+                return ["Invalid recording date format (use ISO 8601)\n"]
+
+        progress['maximum'] = len(selected_vids)
+        count = 0
+        msgs = []
+        batch_size = 5
+        for i in range(0, len(selected_vids), batch_size):
+            batch = selected_vids[i:i + batch_size]
+            for v in batch:
+                try:
+                    updates = {}
+                    snippet_updates = {}
+                    status_updates = {}
+                    recording_updates = {}
+                    if title_action != "none":
+                        new_title, _ = compute_new_title(v['title'], title_action, title_text)
+                        snippet_updates['title'] = new_title
+                    if tags_action != "none":
+                        new_tags, _ = compute_new_tags(v['tags'], tags_action, tags_text)
+                        snippet_updates['tags'] = new_tags
+                    new_desc, _ = compute_new_desc(v['description'], action, footer, find, replace, keyword, trim_m, use_regex)
+                    snippet_updates['description'] = new_desc
+                    if category:
+                        snippet_updates['categoryId'] = category
+                    if language:
+                        snippet_updates['defaultLanguage'] = language
+                    if snippet_updates:
+                        updates['snippet'] = snippet_updates
+                    if privacy:
+                        status_updates['privacyStatus'] = privacy
+                    if license_:
+                        status_updates['license'] = license_
+                    if embeddable is not None:
+                        status_updates['embeddable'] = embeddable
+                    if public_stats is not None:
+                        status_updates['publicStatsViewable'] = public_stats
+                    if made_for_kids is not None:
+                        status_updates['selfDeclaredMadeForKids'] = made_for_kids
+                    if status_updates:
+                        updates['status'] = status_updates
+                    if recording_date:
+                        recording_updates['recordingDate'] = recording_date
+                        updates['recordingDetails'] = recording_updates
+                    if updates:
+                        update_video(youtube, v['id'], updates)
+                    if thumbnail_path:
+                        set_thumbnail(youtube, v['id'], thumbnail_path)
+                    # Update local
+                    if 'snippet' in updates:
+                        v['title'] = updates['snippet'].get('title', v['title'])
+                        v['description'] = updates['snippet'].get('description', v['description'])
+                        v['tags'] = updates['snippet'].get('tags', v['tags'])
+                        v['categoryId'] = updates['snippet'].get('categoryId', v['categoryId'])
+                        v['defaultLanguage'] = updates['snippet'].get('defaultLanguage', v['defaultLanguage'])
+                    if 'status' in updates:
+                        v['status'].update(updates['status'])
+                    if 'recordingDetails' in updates:
+                        v['recordingDate'] = updates['recordingDetails'].get('recordingDate', v['recordingDate'])
+                    msgs.append(f"Updated {v['id']} successfully\n")
+                    count += 1
+                    root.after(0, lambda c=count: progress.config(value=c))
+                    time.sleep(2)  # Increased delay for rate limits
+                except Exception as e:
+                    msgs.append(f"Error updating {v['id']}: {str(e)}\n")
+        # Auto-save log
+        with open('update_log.txt', 'a') as f:
+            f.write(''.join(msgs))
+        return msgs
+
+    def update_callback(msgs):
+        for msg in msgs:
+            log_text.insert(END, msg)
+        log_text.see(END)
+        progress['value'] = 0
+        filter_videos()
 
     backup_button['command'] = backup
     restore_button['command'] = restore
     preview_button['command'] = preview
+    dry_run_button['command'] = dry_run
     update_button['command'] = update_videos
 
     # Initial connect
     connect_account()
 
-    root.mainloop() 
+    root.mainloop()

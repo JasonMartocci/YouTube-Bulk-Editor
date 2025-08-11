@@ -15,7 +15,7 @@ import csv
 import mimetypes
 import threading
 import queue
-from datetime import datetime
+from datetime import datetime, date
 
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
@@ -79,6 +79,49 @@ CATEGORIES = {
 PRIVACY_STATUSES = ['public', 'private', 'unlisted']
 LICENSES = ['youtube', 'creativeCommon']
 
+# API costs in units (from official docs)
+API_COSTS = {
+    'channels.list': 1,
+    'playlistItems.list': 1,
+    'videos.list': 1,
+    'videos.update': 50,
+    'thumbnails.set': 50,
+}
+
+# Quota tracking
+QUOTA_FILE = 'quota_tracker.json'
+DAILY_QUOTA_LIMIT = 10000
+estimated_units = 0
+last_quota_date = date.today()
+
+def load_quota():
+    global estimated_units, last_quota_date
+    if os.path.exists(QUOTA_FILE):
+        with open(QUOTA_FILE, 'r') as f:
+            data = json.load(f)
+            last_date_str = data.get('date')
+            if last_date_str:
+                last_quota_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+            estimated_units = data.get('units', 0)
+            if last_quota_date < date.today():
+                estimated_units = 0
+                last_quota_date = date.today()
+                save_quota()
+
+def save_quota():
+    with open(QUOTA_FILE, 'w') as f:
+        json.dump({'date': last_quota_date.strftime('%Y-%m-%d'), 'units': estimated_units}, f)
+
+def add_quota_usage(method, cost_multiplier=1):
+    global estimated_units
+    cost = API_COSTS.get(method, 0) * cost_multiplier
+    estimated_units += cost
+    save_quota()
+    return cost
+
+def get_remaining_quota():
+    return DAILY_QUOTA_LIMIT - estimated_units
+
 def get_authenticated_service(token_file='token.pickle'):
     creds = None
     if os.path.exists(token_file):
@@ -98,19 +141,28 @@ def get_current_channel(youtube):
             mine=True
         )
         response = request.execute()
+        add_quota_usage('channels.list')
         return response['items'][0]['snippet']['title']
     except Exception as e:
         return "Unknown (Error: " + str(e) + ")"
 
-def get_uploads_playlist_id(youtube):
+def get_uploads_playlist_id(youtube, cache_file='playlist_id_cache.json'):
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            data = json.load(f)
+        return data['playlist_id']
     request = youtube.channels().list(
         part="contentDetails",
         mine=True
     )
     response = request.execute()
-    return response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    add_quota_usage('channels.list')
+    playlist_id = response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    with open(cache_file, 'w') as f:
+        json.dump({'playlist_id': playlist_id}, f)
+    return playlist_id
 
-def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1):
+def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=24):
     if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file) < cache_expiry_hours * 3600):
         with open(cache_file, 'r') as f:
             videos = json.load(f)
@@ -127,6 +179,7 @@ def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1
                 pageToken=next_page_token
             )
             response = request.execute()
+            add_quota_usage('playlistItems.list')
             for item in response['items']:
                 vid = item['snippet']['resourceId']['videoId']
                 snippet = item['snippet']
@@ -137,6 +190,8 @@ def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1
                     'tags': snippet.get('tags', []),
                     'categoryId': snippet.get('categoryId', '22'),
                     'defaultLanguage': snippet.get('defaultLanguage', ''),
+                    'publishedAt': snippet.get('publishedAt', ''),
+                    'lastUpdated': None,  # To be set when updated
                 })
             next_page_token = response.get('nextPageToken')
             if not next_page_token:
@@ -155,6 +210,7 @@ def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1
                     part="snippet,status,recordingDetails",
                     id=batch_ids
                 ).execute()
+                add_quota_usage('videos.list')
                 for item in response['items']:
                     vid = item['id']
                     for v in videos:
@@ -163,6 +219,7 @@ def get_all_videos(youtube, cache_file='videos_cache.json', cache_expiry_hours=1
                             v['defaultLanguage'] = item['snippet'].get('defaultLanguage', v['defaultLanguage'])
                             v['status'] = item['status']
                             v['recordingDate'] = item.get('recordingDetails', {}).get('recordingDate', '')
+                            v['publishedAt'] = item['snippet'].get('publishedAt', v['publishedAt'])
                             break
             except HttpError as e:
                 if e.resp.status in [429, 503]:
@@ -187,6 +244,7 @@ def update_video(youtube, video_id, updates):
             part=','.join(updates.keys()),
             body=body
         ).execute()
+        add_quota_usage('videos.update')
     except HttpError as e:
         if e.resp.status in [429, 503]:
             time.sleep(5)
@@ -201,6 +259,7 @@ def set_thumbnail(youtube, video_id, thumbnail_path):
             videoId=video_id,
             media_body=MediaFileUpload(thumbnail_path, mimetype=mime_type)
         ).execute()
+        add_quota_usage('thumbnails.set')
     except HttpError as e:
         if e.resp.status in [429, 503]:
             time.sleep(5)
@@ -862,6 +921,7 @@ if __name__ == '__main__':
                 part="snippet,status,recordingDetails",
                 id=batch_ids
             ).execute()
+            add_quota_usage('videos.list')
             for item in response['items']:
                 backup_data.append({
                     'id': item['id'],
@@ -986,7 +1046,7 @@ if __name__ == '__main__':
         public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
         made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
         thumbnail_path = thumbnail_path_var.get()
-        language = language_var.get() if language_var.get() != "No Change" else None
+        language = language_var.get() 
         recording_date = recording_var.get() if recording_var.get() != "No Change" else None
         quota_est = estimate_quota(len(selected_vids), bool(thumbnail_path))
         preview_content.append(f"Estimated Quota Use: {quota_est} units (approximate)\n\n")
@@ -1099,9 +1159,8 @@ if __name__ == '__main__':
         public_stats = True if public_stats_var.get() == "true" else False if public_stats_var.get() == "false" else None
         made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
         thumbnail_path = thumbnail_path_var.get()
-        language = language_var.get() if language_var.get() != "No Change" else None
-        recording_date = recording_var.get() if recording_var.get() != "No Change" else None
-
+        language = language_var.get() 
+        recording_date = recording_var.get()
         # Validation
         if action in ["find_replace", "trim", "replace_after"] and use_regex:
             try:

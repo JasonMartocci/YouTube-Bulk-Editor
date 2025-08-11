@@ -1160,7 +1160,7 @@ if __name__ == '__main__':
         made_for_kids = True if made_for_kids_var.get() == "true" else False if made_for_kids_var.get() == "false" else None
         thumbnail_path = thumbnail_path_var.get()
         language = language_var.get() 
-        recording_date = recording_var.get()
+        recording_date = recording_var.get() if recording_var.get() != "No Change" else None
         # Validation
         if action in ["find_replace", "trim", "replace_after"] and use_regex:
             try:
